@@ -5,13 +5,16 @@ services:
   proxy:
     build: ./proxy
 
+  referencia:
+    build: ./referencia
+
   servidor1:
     build: ./servidor
     environment:
       NOME: servidor1
     volumes:
       - dados_servidor1:/dados
-    depends_on: [broker, proxy]
+    depends_on: [broker, proxy, referencia]
 
   servidor2:
     build: ./servidor
@@ -19,7 +22,7 @@ services:
       NOME: servidor2
     volumes:
       - dados_servidor2:/dados
-    depends_on: [broker, proxy]
+    depends_on: [broker, proxy, referencia]
 
   bot1:
     build: ./bot

@@ -21,6 +21,7 @@ const FRASES = [
 ];
 
 let usuario = null;
+let relogio = 0;
 let req = null;
 const sub = new zmq.Subscriber();
 const inscritos = new Set();
@@ -37,11 +38,11 @@ function hora(ts) {
 function mostrar(seta, msg) {
   const campos = [];
   for (const [k, v] of Object.entries(msg)) {
-    if (k === "tipo" || k === "timestamp") continue;
+    if (k === "tipo" || k === "timestamp" || k === "relogio") continue;
     if (Array.isArray(v)) campos.push(`${k}=[${v.join(", ")}]`);
     else campos.push(`${k}=${v}`);
   }
-  console.log(`[${usuario || "?"}] ${seta} ${msg.tipo} | ts=${hora(msg.timestamp)} | ${campos.join(" ")}`);
+  console.log(`[${usuario || "?"}] ${seta} ${msg.tipo} | ts=${hora(msg.timestamp)} relogio=${msg.relogio} | ${campos.join(" ")}`);
 }
 
 async function pedir(tipo, campos = {}) {
@@ -51,13 +52,15 @@ async function pedir(tipo, campos = {}) {
       req.connect(BROKER);
     }
 
-    const msg = { tipo, usuario, timestamp: agora(), ...campos };
+    relogio++;
+    const msg = { tipo, usuario, timestamp: agora(), relogio, ...campos };
     mostrar("->", msg);
 
     try {
       await req.send(encode(msg));
       const [conteudo] = await req.receive();
       const resp = decode(conteudo);
+      relogio = Math.max(relogio, resp.relogio || 0);
       mostrar("<-", resp);
       return resp;
     } catch (err) {
@@ -108,9 +111,10 @@ async function ouvir() {
     // o filtro do zmq e por prefixo
     if (!inscritos.has(canal)) continue;
     const msg = decode(conteudo);
+    relogio = Math.max(relogio, msg.relogio || 0);
     console.log(
       `[${usuario}] <- #${canal} ${msg.usuario}: "${msg.texto}" | enviado=${hora(msg.timestamp)} ` +
-        `recebido=${hora(agora())} (publicado por ${msg.de})`
+        `recebido=${hora(agora())} relogio=${msg.relogio} (publicado por ${msg.de})`
     );
   }
 }
