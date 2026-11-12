@@ -2,12 +2,28 @@ const zmq = require("zeromq");
 const { encode, decode } = require("@msgpack/msgpack");
 
 const BROKER = process.env.BROKER || "tcp://broker:5555";
+const PROXY = process.env.PROXY || "tcp://proxy:5558";
 
 const NOMES = ["ana", "bia", "caio", "duda", "enzo", "gabi", "joao", "lia", "leo", "malu", "nina", "otto", "rafa", "theo"];
 const CANAIS = ["geral", "jogos", "musica", "filmes", "estudos", "memes", "futebol", "receitas", "viagens", "livros", "series"];
+const FRASES = [
+  "oi",
+  "alo",
+  "teste",
+  "testando",
+  "testando 1 2 3",
+  "mensagem de teste",
+  "oi pessoal",
+  "alguem ai?",
+  "bom dia",
+  "tudo bem?",
+  "ok",
+];
 
 let usuario = null;
 let req = null;
+const sub = new zmq.Subscriber();
+const inscritos = new Set();
 
 const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sortear = (lista) => lista[Math.floor(Math.random() * lista.length)];
@@ -77,16 +93,55 @@ async function criarCanal() {
   if (resp.status !== "ok") console.log(`[${usuario}] nao criou o canal: ${resp.erro}`);
 }
 
+function inscrever(canais) {
+  const livres = canais.filter((c) => !inscritos.has(c));
+  if (!livres.length) return;
+  const canal = sortear(livres);
+  sub.subscribe(canal);
+  inscritos.add(canal);
+  console.log(`[${usuario}] me inscrevi em #${canal} (inscrito em: ${[...inscritos].join(", ")})`);
+}
+
+async function ouvir() {
+  for await (const [topico, conteudo] of sub) {
+    const canal = topico.toString();
+    // o filtro do zmq e por prefixo
+    if (!inscritos.has(canal)) continue;
+    const msg = decode(conteudo);
+    console.log(
+      `[${usuario}] <- #${canal} ${msg.usuario}: "${msg.texto}" | enviado=${hora(msg.timestamp)} ` +
+        `recebido=${hora(agora())} (publicado por ${msg.de})`
+    );
+  }
+}
+
 async function main() {
   await esperar(3000);
+  sub.connect(PROXY);
   await login();
+  ouvir();
 
   while (true) {
-    const canais = await listarCanais();
+    let canais = await listarCanais();
     if (canais.length < 5) {
       await criarCanal();
+      canais = await listarCanais();
     }
-    await esperar(3000);
+    if (inscritos.size < 3) {
+      inscrever(canais);
+    }
+    if (!canais.length) {
+      await esperar(1000);
+      continue;
+    }
+
+    const canal = sortear(canais);
+    console.log(`[${usuario}] vou mandar 10 mensagens em #${canal}`);
+    for (let i = 0; i < 10; i++) {
+      const resp = await pedir("publicar", { canal, texto: sortear(FRASES) });
+      if (resp.status !== "ok") console.log(`[${usuario}] erro ao publicar: ${resp.erro}`);
+      await esperar(1000);
+    }
   }
 }
 
