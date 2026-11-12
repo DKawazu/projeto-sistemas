@@ -1,0 +1,9 @@
+{
+  "name": "bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "zeromq": "^6.1.0"
+  }
+}

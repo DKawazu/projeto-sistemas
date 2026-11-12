@@ -1,0 +1,31 @@
+services:
+  broker:
+    build: ./broker
+
+  servidor1:
+    build: ./servidor
+    environment:
+      NOME: servidor1
+    volumes:
+      - dados_servidor1:/dados
+    depends_on: [broker]
+
+  servidor2:
+    build: ./servidor
+    environment:
+      NOME: servidor2
+    volumes:
+      - dados_servidor2:/dados
+    depends_on: [broker]
+
+  bot1:
+    build: ./bot
+    depends_on: [broker]
+
+  bot2:
+    build: ./bot
+    depends_on: [broker]
+
+volumes:
+  dados_servidor1:
+  dados_servidor2:
