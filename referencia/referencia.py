@@ -55,7 +55,7 @@ def tratar(msg):
         if nome not in vistos:
             print(f"[referencia] {nome} voltou pra lista", flush=True)
         vistos[nome] = time.time()
-        return resposta(tipo, hora=time.time())
+        return resposta(tipo)
 
     return resposta(tipo, erro="tipo desconhecido")
 

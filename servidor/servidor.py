@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+import threading
 import time
 
 import msgpack
@@ -9,17 +10,25 @@ import zmq
 NOME = os.environ.get("NOME", "servidor")
 BROKER = os.environ.get("BROKER", "tcp://broker:5556")
 PROXY_XSUB = os.environ.get("PROXY_XSUB", "tcp://proxy:5557")
+PROXY_XPUB = os.environ.get("PROXY_XPUB", "tcp://proxy:5558")
 REFERENCIA = os.environ.get("REFERENCIA", "tcp://referencia:5559")
 BANCO = os.environ.get("BANCO", "/dados/dados.db")
+PORTA = 6000
 
 NOME_VALIDO = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 
 ajuste = 0.0
 relogio = 0
 meu_rank = None
+coordenador = None
+diferencas = {}
 
 ctx = zmq.Context()
 pub = None
+
+trava_relogio = threading.Lock()
+trava_pub = threading.Lock()
+trava_eleicao = threading.Lock()
 
 
 def hora():
@@ -28,13 +37,15 @@ def hora():
 
 def tick():
     global relogio
-    relogio += 1
-    return relogio
+    with trava_relogio:
+        relogio += 1
+        return relogio
 
 
 def atualiza_relogio(recebido):
     global relogio
-    relogio = max(relogio, recebido or 0)
+    with trava_relogio:
+        relogio = max(relogio, recebido or 0)
 
 
 def nova_msg(tipo, **campos):
@@ -86,12 +97,17 @@ def pedir(endereco, msg, timeout=2000):
 
 def publicar(topico, msg):
     mostrar("->", msg, f"PUB[{topico}] ")
-    pub.send_multipart([topico.encode(), msgpack.packb(msg)])
+    with trava_pub:
+        pub.send_multipart([topico.encode(), msgpack.packb(msg)])
+
+
+def endereco(nome):
+    return f"tcp://{nome}:{PORTA}"
 
 
 def abrir_banco():
     os.makedirs(os.path.dirname(BANCO), exist_ok=True)
-    con = sqlite3.connect(BANCO)
+    con = sqlite3.connect(BANCO, check_same_thread=False)
     con.execute("create table if not exists logins (id integer primary key autoincrement, usuario text, timestamp real)")
     con.execute("create table if not exists canais (nome text primary key, criado_por text, timestamp real)")
     con.execute("create table if not exists mensagens (id integer primary key autoincrement, canal text, usuario text, "
@@ -114,7 +130,7 @@ def tratar_login(msg):
 
 def tratar_criar_canal(msg):
     canal = msg.get("canal") or ""
-    if not NOME_VALIDO.match(canal):
+    if not NOME_VALIDO.match(canal) or canal == "servers":
         return resposta("criar_canal", erro=f"nome de canal invalido: {canal}")
     if banco.execute("select 1 from canais where nome = ?", (canal,)).fetchone():
         return resposta("criar_canal", erro=f"o canal {canal} ja existe")
@@ -165,18 +181,117 @@ def registrar():
         time.sleep(2)
 
 
+def listar_servidores():
+    resp = pedir(REFERENCIA, nova_msg("listar"))
+    if not resp:
+        return []
+    return resp.get("servidores", [])
+
+
 def heartbeat():
-    global ajuste
-    antes = time.time()
-    resp = pedir(REFERENCIA, nova_msg("heartbeat", nome=NOME))
-    depois = time.time()
-    if not resp or resp.get("status") != "ok":
+    pedir(REFERENCIA, nova_msg("heartbeat", nome=NOME))
+
+
+def sincronizar_relogio():
+    global ajuste, coordenador
+    if coordenador is None:
+        threading.Thread(target=eleicao, daemon=True).start()
+        return
+    if coordenador == NOME:
+        print(f"[{NOME}] sou o coordenador, nao preciso pedir a hora (ajuste {ajuste:+.3f}s)", flush=True)
         return
 
-    certa = resp["hora"] + (depois - antes) / 2
+    antes = time.time()
+    resp = pedir(endereco(coordenador), nova_msg("relogio"))
+    depois = time.time()
+    if not resp or resp.get("status") != "ok":
+        print(f"[{NOME}] coordenador {coordenador} nao respondeu, vou chamar eleicao", flush=True)
+        coordenador = None
+        threading.Thread(target=eleicao, daemon=True).start()
+        return
+
+    certa = resp["hora_correta"] + (depois - antes) / 2
     correcao = certa - (depois + ajuste)
     ajuste += correcao
     print(f"[{NOME}] relogio corrigido em {correcao:+.3f}s (ajuste total {ajuste:+.3f}s)", flush=True)
+
+
+def berkeley(msg):
+    global ajuste
+    if coordenador != NOME:
+        return resposta("relogio", erro=f"nao sou o coordenador (acho que e {coordenador})")
+
+    diferencas[msg["de"]] = msg["timestamp"] - hora()
+    media = sum(diferencas.values()) / (len(diferencas) + 1)
+    ajuste += media
+    for nome in diferencas:
+        diferencas[nome] -= media
+    diferencas[msg["de"]] = 0
+
+    print(f"[{NOME}] berkeley: media {media:+.3f}s, meu ajuste agora {ajuste:+.3f}s", flush=True)
+    return resposta("relogio", hora_correta=hora())
+
+
+def eleicao():
+    global coordenador
+    if not trava_eleicao.acquire(blocking=False):
+        return
+    try:
+        print(f"[{NOME}] comecando eleicao (meu rank {meu_rank})", flush=True)
+        maiores = [s for s in listar_servidores() if s["rank"] > meu_rank]
+
+        alguem_respondeu = False
+        for s in maiores:
+            resp = pedir(endereco(s["nome"]), nova_msg("eleicao", rank=meu_rank), timeout=1500)
+            if resp and resp.get("status") == "ok":
+                alguem_respondeu = True
+
+        if not alguem_respondeu:
+            coordenador = NOME
+            print(f"[{NOME}] ganhei a eleicao, agora sou o coordenador", flush=True)
+            publicar("servers", nova_msg("coordenador", coordenador=NOME))
+    finally:
+        trava_eleicao.release()
+
+
+def ouvir_topicos():
+    global coordenador
+    sub = ctx.socket(zmq.SUB)
+    sub.connect(PROXY_XPUB)
+    sub.setsockopt_string(zmq.SUBSCRIBE, "servers")
+    while True:
+        topico, conteudo = sub.recv_multipart()
+        topico = topico.decode()
+        if topico != "servers":
+            continue
+        msg = msgpack.unpackb(conteudo)
+        if msg.get("de") == NOME:
+            continue
+        atualiza_relogio(msg.get("relogio"))
+        mostrar("<-", msg, f"SUB[{topico}] ")
+        coordenador = msg["coordenador"]
+        print(f"[{NOME}] coordenador agora e {coordenador}", flush=True)
+
+
+def atender_servidores():
+    rep = ctx.socket(zmq.REP)
+    rep.bind(f"tcp://*:{PORTA}")
+    while True:
+        msg = msgpack.unpackb(rep.recv())
+        atualiza_relogio(msg.get("relogio"))
+        mostrar("<-", msg)
+        tipo = msg.get("tipo")
+
+        if tipo == "eleicao":
+            resp = resposta("eleicao")
+            threading.Thread(target=eleicao, daemon=True).start()
+        elif tipo == "relogio":
+            resp = berkeley(msg)
+        else:
+            resp = resposta(tipo, erro="tipo desconhecido")
+
+        mostrar("->", resp)
+        rep.send(msgpack.packb(resp))
 
 
 def main():
@@ -185,8 +300,11 @@ def main():
 
     pub = ctx.socket(zmq.PUB)
     pub.connect(PROXY_XSUB)
+    threading.Thread(target=ouvir_topicos, daemon=True).start()
+    threading.Thread(target=atender_servidores, daemon=True).start()
 
     registrar()
+    threading.Thread(target=eleicao, daemon=True).start()
 
     rep = ctx.socket(zmq.REP)
     rep.connect(BROKER)
@@ -210,6 +328,8 @@ def main():
         recebidas += 1
         if recebidas % 10 == 0:
             heartbeat()
+        if recebidas % 15 == 0:
+            sincronizar_relogio()
 
 
 if __name__ == "__main__":
