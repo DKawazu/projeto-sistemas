@@ -1,0 +1,46 @@
+services:
+  broker:
+    build: ./broker
+
+  proxy:
+    build: ./proxy
+
+  referencia:
+    build: ./referencia
+
+  servidor1:
+    build: ./servidor
+    environment:
+      NOME: servidor1
+    volumes:
+      - dados_servidor1:/dados
+    depends_on: [broker, proxy, referencia]
+
+  servidor2:
+    build: ./servidor
+    environment:
+      NOME: servidor2
+    volumes:
+      - dados_servidor2:/dados
+    depends_on: [broker, proxy, referencia]
+
+  servidor3:
+    build: ./servidor
+    environment:
+      NOME: servidor3
+    volumes:
+      - dados_servidor3:/dados
+    depends_on: [broker, proxy, referencia]
+
+  bot1:
+    build: ./bot
+    depends_on: [broker, proxy]
+
+  bot2:
+    build: ./bot
+    depends_on: [broker, proxy]
+
+volumes:
+  dados_servidor1:
+  dados_servidor2:
+  dados_servidor3:
