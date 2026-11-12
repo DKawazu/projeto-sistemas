@@ -30,3 +30,13 @@ O nome do canal é o tópico do Pub/Sub. Quando o servidor recebe um `publicar`,
 ## Persistência
 
 Cada servidor tem o seu próprio banco SQLite, num volume separado. Os logins ficam na tabela `logins` (usuário e timestamp), os canais na tabela `canais` e as publicações na tabela `mensagens` (canal, usuário, texto, timestamp e relógio lógico).
+
+## Replicação
+
+Usei replicação ativa: toda alteração é enviada pra todas as réplicas e cada uma aplica no seu banco. O servidor que recebe o pedido do bot (login, criar canal ou publicar) grava no seu banco e publica a alteração no tópico `replica` do proxy. Os outros servidores estão inscritos nesse tópico e gravam a mesma coisa. Assim todos ficam com todos os dados, não importa pra qual servidor o broker mandou o pedido.
+
+Mudanças que precisei fazer:
+
+- Não usei ordem total nas mensagens de réplica, porque as operações são só inserções e o resultado final é o mesmo em qualquer ordem.
+- Cada registro ganhou um id (uuid) e a gravação ignora o que já existe, pra não duplicar.
+- O Pub/Sub não guarda mensagem, então um servidor que estava fora perde o que foi publicado nesse tempo. Por isso, quando um servidor sobe ele pede tudo pra outro servidor (pedido `sincronizar` na porta 6000) e grava o que estiver faltando.

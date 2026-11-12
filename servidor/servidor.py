@@ -3,6 +3,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 
 import msgpack
 import zmq
@@ -16,6 +17,7 @@ BANCO = os.environ.get("BANCO", "/dados/dados.db")
 PORTA = 6000
 
 NOME_VALIDO = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
+RESERVADOS = ("servers", "replica")
 
 ajuste = 0.0
 relogio = 0
@@ -28,6 +30,7 @@ pub = None
 
 trava_relogio = threading.Lock()
 trava_pub = threading.Lock()
+trava_banco = threading.Lock()
 trava_eleicao = threading.Lock()
 
 
@@ -71,6 +74,8 @@ def mostrar(seta, msg, onde=""):
     for k, v in msg.items():
         if k in ("tipo", "timestamp", "relogio"):
             continue
+        if isinstance(v, list) and len(v) > 10:
+            v = f"[{len(v)} itens]"
         campos.append(f"{k}={v}")
     print(f"[{NOME}] {seta} {onde}{msg.get('tipo')} | ts={fmt(msg.get('timestamp'))} "
           f"relogio={msg.get('relogio')} | {' '.join(campos)}", flush=True)
@@ -108,10 +113,10 @@ def endereco(nome):
 def abrir_banco():
     os.makedirs(os.path.dirname(BANCO), exist_ok=True)
     con = sqlite3.connect(BANCO, check_same_thread=False)
-    con.execute("create table if not exists logins (id integer primary key autoincrement, usuario text, timestamp real)")
-    con.execute("create table if not exists canais (nome text primary key, criado_por text, timestamp real)")
-    con.execute("create table if not exists mensagens (id integer primary key autoincrement, canal text, usuario text, "
-                "texto text, timestamp real, relogio integer)")
+    con.execute("create table if not exists logins (id text primary key, usuario text, timestamp real, servidor text)")
+    con.execute("create table if not exists canais (nome text primary key, criado_por text, timestamp real, servidor text)")
+    con.execute("create table if not exists mensagens (id text primary key, canal text, usuario text, texto text, "
+                "timestamp real, relogio integer, servidor text)")
     con.commit()
     return con
 
@@ -119,36 +124,62 @@ def abrir_banco():
 banco = abrir_banco()
 
 
+def salvar(tabela, dados):
+    colunas = ", ".join(dados.keys())
+    marcas = ", ".join("?" for _ in dados)
+    with trava_banco:
+        cur = banco.execute(f"insert or ignore into {tabela} ({colunas}) values ({marcas})", list(dados.values()))
+        banco.commit()
+    return cur.rowcount > 0
+
+
+def consultar(sql, *args):
+    with trava_banco:
+        return banco.execute(sql, args).fetchall()
+
+
+def tabela_toda(tabela):
+    with trava_banco:
+        cur = banco.execute(f"select * from {tabela}")
+        colunas = [c[0] for c in cur.description]
+        return [dict(zip(colunas, linha)) for linha in cur.fetchall()]
+
+
+def replicar(tabela, dados):
+    publicar("replica", nova_msg("replica", tabela=tabela, dados=dados))
+
+
 def tratar_login(msg):
     usuario = msg.get("usuario") or ""
     if not NOME_VALIDO.match(usuario):
         return resposta("login", erro="nome invalido, use de 3 a 20 letras, numeros ou _")
-    banco.execute("insert into logins (usuario, timestamp) values (?, ?)", (usuario, hora()))
-    banco.commit()
+    dados = {"id": uuid.uuid4().hex, "usuario": usuario, "timestamp": hora(), "servidor": NOME}
+    salvar("logins", dados)
+    replicar("logins", dados)
     return resposta("login", usuario=usuario)
 
 
 def tratar_criar_canal(msg):
     canal = msg.get("canal") or ""
-    if not NOME_VALIDO.match(canal) or canal == "servers":
+    if not NOME_VALIDO.match(canal) or canal in RESERVADOS:
         return resposta("criar_canal", erro=f"nome de canal invalido: {canal}")
-    if banco.execute("select 1 from canais where nome = ?", (canal,)).fetchone():
+    if consultar("select 1 from canais where nome = ?", canal):
         return resposta("criar_canal", erro=f"o canal {canal} ja existe")
-    banco.execute("insert into canais (nome, criado_por, timestamp) values (?, ?, ?)",
-                  (canal, msg.get("usuario"), hora()))
-    banco.commit()
+    dados = {"nome": canal, "criado_por": msg.get("usuario"), "timestamp": hora(), "servidor": NOME}
+    salvar("canais", dados)
+    replicar("canais", dados)
     return resposta("criar_canal", canal=canal)
 
 
 def tratar_listar_canais(msg):
-    canais = [linha[0] for linha in banco.execute("select nome from canais order by nome")]
+    canais = [linha[0] for linha in consultar("select nome from canais order by nome")]
     return resposta("listar_canais", canais=canais)
 
 
 def tratar_publicar(msg):
     canal = msg.get("canal")
     texto = msg.get("texto") or ""
-    if not banco.execute("select 1 from canais where nome = ?", (canal,)).fetchone():
+    if not consultar("select 1 from canais where nome = ?", canal):
         return resposta("publicar", erro=f"o canal {canal} nao existe")
     if not texto.strip():
         return resposta("publicar", erro="mensagem vazia")
@@ -156,9 +187,10 @@ def tratar_publicar(msg):
     publicacao = nova_msg("publicacao", canal=canal, usuario=msg.get("usuario"), texto=texto)
     publicar(canal, publicacao)
 
-    banco.execute("insert into mensagens (canal, usuario, texto, timestamp, relogio) values (?, ?, ?, ?, ?)",
-                  (canal, msg.get("usuario"), texto, publicacao["timestamp"], publicacao["relogio"]))
-    banco.commit()
+    dados = {"id": uuid.uuid4().hex, "canal": canal, "usuario": msg.get("usuario"), "texto": texto,
+             "timestamp": publicacao["timestamp"], "relogio": publicacao["relogio"], "servidor": NOME}
+    salvar("mensagens", dados)
+    replicar("mensagens", dados)
     return resposta("publicar", canal=canal)
 
 
@@ -259,18 +291,23 @@ def ouvir_topicos():
     sub = ctx.socket(zmq.SUB)
     sub.connect(PROXY_XPUB)
     sub.setsockopt_string(zmq.SUBSCRIBE, "servers")
+    sub.setsockopt_string(zmq.SUBSCRIBE, "replica")
     while True:
         topico, conteudo = sub.recv_multipart()
         topico = topico.decode()
-        if topico != "servers":
+        if topico not in RESERVADOS:
             continue
         msg = msgpack.unpackb(conteudo)
         if msg.get("de") == NOME:
             continue
         atualiza_relogio(msg.get("relogio"))
         mostrar("<-", msg, f"SUB[{topico}] ")
-        coordenador = msg["coordenador"]
-        print(f"[{NOME}] coordenador agora e {coordenador}", flush=True)
+
+        if topico == "servers":
+            coordenador = msg["coordenador"]
+            print(f"[{NOME}] coordenador agora e {coordenador}", flush=True)
+        else:
+            salvar(msg["tabela"], msg["dados"])
 
 
 def atender_servidores():
@@ -287,11 +324,31 @@ def atender_servidores():
             threading.Thread(target=eleicao, daemon=True).start()
         elif tipo == "relogio":
             resp = berkeley(msg)
+        elif tipo == "sincronizar":
+            resp = resposta("sincronizar", logins=tabela_toda("logins"), canais=tabela_toda("canais"),
+                            mensagens=tabela_toda("mensagens"))
         else:
             resp = resposta(tipo, erro="tipo desconhecido")
 
         mostrar("->", resp)
         rep.send(msgpack.packb(resp))
+
+
+def sincronizar_dados():
+    for s in listar_servidores():
+        if s["nome"] == NOME:
+            continue
+        resp = pedir(endereco(s["nome"]), nova_msg("sincronizar"), timeout=5000)
+        if not resp or resp.get("status") != "ok":
+            continue
+        novos = 0
+        for tabela in ("logins", "canais", "mensagens"):
+            for dados in resp.get(tabela, []):
+                if salvar(tabela, dados):
+                    novos += 1
+        print(f"[{NOME}] copiei {novos} registros novos de {s['nome']}", flush=True)
+        return
+    print(f"[{NOME}] nao achei outro servidor pra copiar os dados", flush=True)
 
 
 def main():
@@ -304,6 +361,7 @@ def main():
     threading.Thread(target=atender_servidores, daemon=True).start()
 
     registrar()
+    sincronizar_dados()
     threading.Thread(target=eleicao, daemon=True).start()
 
     rep = ctx.socket(zmq.REP)
